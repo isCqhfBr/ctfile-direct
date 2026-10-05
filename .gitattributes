@@ -1,0 +1,13 @@
+# 默认自动判断文本文件
+* text=auto
+
+# Windows 批处理必须是 CRLF，否则 cmd 会解析失败
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 其余保持 LF，避免跨平台 diff 噪音
+*.cs    text eol=lf
+*.mjs   text eol=lf
+*.md    text eol=lf
+*.json  text eol=lf
+*.csproj text eol=lf

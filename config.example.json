@@ -1,0 +1,8 @@
+{
+  "_说明": "把本文件复制成 config.json 再填自己的账号。每个免费账号提供 2 个并发连接，N 个账号 = 2N 线程，匿名槽再 +1。",
+  "_风险": "城通风控会针对「同一 IP 多账号下载同一文件」，被判定多用户登录的账号会被锁定（登录返回 401 多用户登录被锁定）。建议只用自己的日常账号，不要批量注册小号。",
+  "useAnonymous": true,
+  "accounts": [
+    { "email": "your-account@example.com", "password": "your-password" }
+  ]
+}

@@ -1,0 +1,23 @@
+# 配置文件里有明文账号密码，绝对不要提交
+config.json
+config.local.json
+
+# 构建产物
+src/bin/
+src/obj/
+dist/
+*.exe
+*.pdb
+*.user
+
+# 编辑器 / 系统
+.vs/
+.idea/
+.vscode/*
+!.vscode/extensions.json
+Thumbs.db
+desktop.ini
+*.log
+
+# 本机 node 路径覆盖（各人机器不同，不提交）
+cli/node-path.txt
