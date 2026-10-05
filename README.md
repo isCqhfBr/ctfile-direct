@@ -8,6 +8,8 @@
 - 🧩 同时提供 Node.js 命令行版，方便脚本化调用
 - 📄 完整记录了逆向出来的接口行为 → [docs/API.md](docs/API.md)
 
+![界面截图](docs/screenshot.png)
+
 > **本项目的由来**：网上流传的 [nekohy/ctfile-downloader](https://github.com/nekohy/ctfile-downloader)
 > 依赖的登录接口 `rest.ctfile.com/p2/user/auth/login` 已被城通服务端废弃（一律返回 `410 请升级客户端`），
 > 作者演示站域名也已过期，整个项目已经不能用了。
