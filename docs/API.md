@@ -154,6 +154,69 @@ https://201-usw-data.ctcontents.com/d37476991/<hash>/.txt
 
 7. **下载器必须预检 + 剔除死链**：否则任一分块失败会导致整个下载报错。
 
+## 另一条登录路径：p8 接口（返回 Web 会话 cookie）
+
+除了 `api.ctfile.com/v4/user/auth/login`（返回 token），城通还有一个返回**网页会话 cookie** 的登录接口：
+
+```
+POST https://rest.ctfile.com/p8/public/login/login
+Content-Type: application/json
+Origin: https://www.ctfile.com
+Referer: https://www.ctfile.com
+
+{"email": "...", "password": "...", "ref": "https://home.ctfile.com/#item-files/action-index"}
+```
+
+返回 `{"code":200,"message":"Login successful"}`，并在响应头里下发 4 个 cookie，其中
+`ctfile_session` 是会话凭证。
+
+**带这个 cookie 调 `getfile.php` 的差别**（实测）：
+
+| | `is_guest` | `my_username` | 直链 `limit` |
+|---|---|---|---|
+| 不带 cookie | `true` | 空 | 1 |
+| 带 cookie（免费号） | `false` | 正确显示账号 | 1 |
+
+也就是说：cookie 会让接口认得你（`cts` 参数里会带上 uid），
+但**免费账号的 `limit` 不会从 1 变成 2**，速度也没有变化。
+真正给 2 线程的是 `rest/ p2` 的客户端接口（见上文）。
+
+## ⭐ 镜像线路（真正的「换节点」）—— 但只有 VIP 有
+
+带 cookie 调 `getfile.php` 时，**VIP 会话**的 `file` 对象里会多出这几个字段：
+
+```
+vip_dx_url      电信线路
+vip_lt_url      联通线路
+vip_yd_url      移动线路
+vip_cdn_url     VIP CDN
+us_downurl_a    美国线路
+```
+
+这是**唯一能换线路的入口**（直接改直链的主机名只会 503，见上文）。
+本项目用免费账号实测时这些字段**不存在**，所以：
+
+- **免费账号**：只能拿到一条直链，线路/节点由服务端定死；
+  提速手段只有「增加并发连接数」（多账号 = 每号 2 条）。
+- **VIP 账号**：可以拿到多条线路，从中挑最快的一条。
+
+（信息来源：[SSujitX/ctfile-downloader](https://github.com/SSujitX/ctfile-downloader)
+的 Pro 版本实现。）
+
+## ⭐ 速度上限是 `spd`，而且按文件分配
+
+直链里的 `spd` 参数就是**单连接速度上限**（字节/秒）。实测完全吻合：
+
+| 文件 | `spd` | 单连接实测 |
+|---|---|---|
+| 13.5 MB 小说 | `100000` | 104 KB/s |
+| 157 MB PDF | `35000` | 33 KB/s |
+
+所以「这个文件天生慢」和「这个节点慢」是两回事 —— **先看 `spd` 就知道上限**，
+用 `spd ÷ 1024` 就是单连接的 KB/s 上限，乘上你能开的连接数就是理论最快速度。
+
+`spd` 是按文件（大概是分享者账号档位 / 上传时的策略）由服务端下发的，客户端改不了。
+
 ## 未解 / 未验证
 
 - `api.ctfile.com/v4/public/browser/*`（`validate` / `list` / `create-download-auth`）
