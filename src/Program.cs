@@ -82,8 +82,14 @@ namespace CtfileDownloader
             Console.WriteLine("大小   : " + Fmt(r.FileSize));
             Console.WriteLine("并发   : " + r.TotalThreads + " 线程 / " + r.Sources.Count + " 条直链");
             foreach (var s in r.Sources)
-                Console.WriteLine("   · " + s.Label.PadRight(30) + s.Threads + " 线程  " + s.Host);
+            {
+                string spd = s.Spd > 0 ? "  " + (s.Spd / 1024) + " KB/s" : "";
+                Console.WriteLine("   · " + s.Label.PadRight(30) + s.Threads + " 线程  " + s.Host + spd);
+            }
             foreach (var w in r.Warnings) Console.WriteLine("  ! " + w);
+
+            string est = Ctfile.EstimateTime(r.Sources, r.FileSize);
+            if (!string.IsNullOrEmpty(est)) Console.WriteLine("预计耗时 : " + est);
 
             if (noDownload) return 0;
 

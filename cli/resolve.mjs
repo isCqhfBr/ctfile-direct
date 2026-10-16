@@ -3,7 +3,7 @@
 import { writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { resolveShare } from './core.mjs'
+import { resolveShare, estimateTime } from './core.mjs'
 
 const argv = process.argv.slice(2)
 const urlOnly = argv.includes('--url-only')
@@ -42,7 +42,9 @@ if (asJson) {
   console.log('  文件名 : ' + r.fileName)
   if (r.fileSize) console.log('  大小   : ' + (r.fileSize / 1048576).toFixed(2) + ' MB')
   console.log('  直链来源：')
-  for (const s of r.sources) console.log('    · ' + String(s.label).padEnd(30) + s.threads + ' 线程  ' + s.host)
+  for (const s of r.sources) console.log('    · ' + String(s.label).padEnd(30) + s.threads + ' 线程  ' + s.host + (s.spd ? '  ' + (s.spd / 1024 | 0) + ' KB/s' : ''))
+  const est = estimateTime(r.sources, r.fileSize)
+  if (est) console.log('  预计耗时 : ' + est)
   console.log('')
   console.log(`  ⚡ 合计 ${r.sources.length} 条直链 / ${r.totalThreads} 线程并发`)
   for (const w of r.warnings) console.log('  ⚠️  ' + w)

@@ -169,7 +169,7 @@ export async function resolveShare(input) {
         const dl = await p2('/p2/browser/file/fetch_url', { xtlink, file_id: item.key, token })
         if (dl.code === 200 && dl.download_url) {
           const threads = Number(new URL(dl.download_url).searchParams.get('limit')) || 2
-          sources.push({ url: dl.download_url, threads, label: acc.email, kind: 'account', host: new URL(dl.download_url).host })
+          sources.push({ url: dl.download_url, threads, label: acc.email, kind: 'account', host: new URL(dl.download_url).host, spd: readSpd(dl.download_url) })
           accountsInfo.push({ email: acc.email, uid, group, threads, ok: true })
           fileName = item.name || fileName
           fileSize = item.size || fileSize
@@ -195,7 +195,7 @@ export async function resolveShare(input) {
       const data = await fetchJson(`${WEBAPI}/get_down_url.php?${q}`, { headers }, '匿名直链接口')
       if (data.downurl) {
         const threads = Number(new URL(data.downurl).searchParams.get('limit')) || 1
-        sources.push({ url: data.downurl, threads, label: '匿名', kind: 'anonymous', host: new URL(data.downurl).host })
+        sources.push({ url: data.downurl, threads, label: '匿名', kind: 'anonymous', host: new URL(data.downurl).host, spd: readSpd(data.downurl) })
         fileSize = fileSize || Number(data.file_size) || null
       }
     } catch (e) {
@@ -206,6 +206,38 @@ export async function resolveShare(input) {
   if (!sources.length) throw new Error(warnings.length ? warnings.join('；') : '没有拿到任何可用直链')
 
   return { fileName, fileSize, sources, warnings, accountsInfo, totalThreads: sources.reduce((s, x) => s + x.threads, 0) }
+}
+
+// ---------------- 估算 ----------------
+/** 从直链里读单连接限速（字节/秒）。0 = 读不到 */
+export function readSpd(url) {
+  try {
+    const v = Number(new URL(url).searchParams.get('spd'))
+    return Number.isFinite(v) && v > 0 ? v : 0
+  } catch { return 0 }
+}
+
+/**
+ * 估算下载耗时（保守下限）。
+ * 实测标定（2026-10-16，13.5MB 文件）：4 路（3 条 spd=30000 + 1 条 spd=100000）
+ * 实际跑到 933 KB/s —— 远超 spd 之和，说明 spd 是软限速，实际取决于 CDN 负载。
+ * 另一次 7 路慢档聚合 109 KB/s（≈单连接 3.3 倍）。
+ * 所以按「各连接 spd 之和」给下限，实际通常更快；只用于提示量级。
+ */
+export function estimateTime(sources, totalBytes) {
+  if (!totalBytes || totalBytes <= 0) return ''
+  let sum = 0
+  let conns = 0
+  for (const s of sources) {
+    const t = Math.max(1, s.threads || 1)
+    conns += t
+    sum += (s.spd > 0 ? s.spd : 100000) * t
+  }
+  if (conns === 0 || sum < 1024) return ''
+  const secs = totalBytes / sum
+  if (secs < 60) return `至少 ${Math.max(1, Math.round(secs))} 秒`
+  if (secs < 3600) return `至少 ${Math.floor(secs / 60)} 分 ${Math.floor(secs % 60)} 秒`
+  return `至少 ${Math.floor(secs / 3600)} 小时 ${Math.floor((secs % 3600) / 60)} 分`
 }
 
 // ---------------- 多来源并发下载 ----------------

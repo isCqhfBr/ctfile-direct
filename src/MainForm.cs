@@ -139,7 +139,7 @@ namespace CtfileDownloader
             lvSources.Columns.Add("来源", 400);
             lvSources.Columns.Add("线程", 70);
             lvSources.Columns.Add("主机", 300);
-            lvSources.Columns.Add("类型", 130);
+            lvSources.Columns.Add("限速", 130);
             lvSources.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
             Controls.Add(lvSources);
 
@@ -317,13 +317,15 @@ namespace CtfileDownloader
                 _cfg.useAnonymous = chkAnon.Checked;
                 var r = await Ctfile.ResolveAsync(txtLink.Text, _cfg, SetStatus);
                 _resolved = r;
-                lblFile.Text = r.FileName + "    " + Fmt(r.FileSize) + "    合计 " + r.TotalThreads + " 线程并发";
+                string est = Ctfile.EstimateTime(r.Sources, r.FileSize);
+                lblFile.Text = r.FileName + "    " + Fmt(r.FileSize) + "    合计 " + r.TotalThreads + " 线程并发"
+                             + (string.IsNullOrEmpty(est) ? "" : "    预计 " + est);
                 foreach (var s in r.Sources)
                 {
                     var it = new ListViewItem(s.Label);
                     it.SubItems.Add(s.Threads.ToString());
                     it.SubItems.Add(s.Host);
-                    it.SubItems.Add(s.Kind == "account" ? "账号" : "匿名");
+                    it.SubItems.Add(s.Spd > 0 ? (s.Spd / 1024) + " KB/s" : (s.Kind == "account" ? "账号" : "匿名"));
                     lvSources.Items.Add(it);
                 }
                 btnDl.Enabled = true;

@@ -12,6 +12,7 @@ namespace CtfileDownloader
         public string Label { get; set; }
         public string Host { get; set; }
         public string Kind { get; set; }   // account / anonymous
+        public int Spd { get; set; }        // 单连接限速（字节/秒），服务端下发；0 = 未知
     }
 
     public class Resolved
@@ -220,7 +221,7 @@ namespace CtfileDownloader
                         {
                             int th = 2;
                             try { var q2 = new Uri(url).Query; var mt = System.Text.RegularExpressions.Regex.Match(q2, @"[?&]limit=(\d+)"); if (mt.Success) th = int.Parse(mt.Groups[1].Value); } catch { }
-                            result.Sources.Add(new Source { Url = url, Threads = th, Label = acc.email, Kind = "account", Host = SafeHost(url) });
+                            result.Sources.Add(new Source { Url = url, Threads = th, Label = acc.email, Kind = "account", Host = SafeHost(url), Spd = ReadSpd(url) });
                             if (!string.IsNullOrEmpty(itemName)) result.FileName = itemName;
                             if (itemSize > 0) result.FileSize = itemSize;
                             L(acc.email + " → " + th + " 线程");
@@ -251,7 +252,7 @@ namespace CtfileDownloader
                         string u = durl.GetString();
                         int th = 1;
                         try { var mt = System.Text.RegularExpressions.Regex.Match(new Uri(u).Query, @"[?&]limit=(\d+)"); if (mt.Success) th = int.Parse(mt.Groups[1].Value); } catch { }
-                        result.Sources.Add(new Source { Url = u, Threads = th, Label = "匿名", Kind = "anonymous", Host = SafeHost(u) });
+                        result.Sources.Add(new Source { Url = u, Threads = th, Label = "匿名", Kind = "anonymous", Host = SafeHost(u), Spd = ReadSpd(u) });
                         if (result.FileSize == 0 && du.TryGetProperty("file_size", out var fs) && fs.ValueKind == JsonValueKind.Number) result.FileSize = fs.GetInt64();
                         L("匿名 → " + th + " 线程");
                     }
@@ -273,6 +274,46 @@ namespace CtfileDownloader
         static string SafeHost(string url)
         {
             try { return new Uri(url).Host; } catch { return "?"; }
+        }
+
+        /// <summary>从直链里读单连接限速（字节/秒）。0 = 读不到</summary>
+        public static int ReadSpd(string url)
+        {
+            try
+            {
+                var m = System.Text.RegularExpressions.Regex.Match(new Uri(url).Query, @"[?&]spd=(\d+)");
+                if (m.Success) return int.Parse(m.Groups[1].Value);
+            }
+            catch { }
+            return 0;
+        }
+
+        /// <summary>
+        /// 估算下载耗时（保守下限）。
+        /// 实测标定（2026-10-16，13.5MB 文件）：
+        ///   4 路（3 条 spd=30000 + 1 条 spd=100000）实际 933 KB/s —— 远超 spd 之和，
+        ///   说明 spd 是「软限速」，实际能跑多快取决于 CDN 当时的负载，不可预测。
+        ///   另一次 7 路慢档实测聚合 109 KB/s（≈ 单连接的 3.3 倍）。
+        /// 所以这里按「每条连接的 spd 之和」给一个下限，实际通常更快；只用于提示量级，
+        /// 不承诺准确。真正慢的文件（几百 MB 的慢档）用这个估是准的。
+        /// </summary>
+        public static string EstimateTime(List<Source> sources, long totalBytes)
+        {
+            if (totalBytes <= 0) return "";
+            double sum = 0; int conns = 0;
+            foreach (var s in sources)
+            {
+                int t = Math.Max(1, s.Threads);
+                conns += t;
+                // 读不到 spd 时按 100KB/s 兜底
+                sum += (s.Spd > 0 ? s.Spd : 100000) * t;
+            }
+            if (conns == 0 || sum < 1024) return "";
+            double secs = totalBytes / sum;
+            var ts = TimeSpan.FromSeconds(secs);
+            return secs < 60 ? $"至少 {Math.Max(1, (int)Math.Round(secs))} 秒"
+                 : secs < 3600 ? $"至少 {ts.Minutes} 分 {ts.Seconds} 秒"
+                 : $"至少 {ts.Hours} 小时 {ts.Minutes} 分";
         }
 
         /// <summary>多来源并发下载，返回实际线程数</summary>
