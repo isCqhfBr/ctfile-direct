@@ -232,5 +232,4 @@ us_downurl_a    美国线路
 - `api.ctfile.com/v4/public/browser/*`（`validate` / `list` / `create-download-auth`）
   看起来是给分享页用的新接口，但试过 `url` / `code` / `link` 作为参数名都返回
   `api.public.missing_link`，没找到正确的参数名。破解它也许能摆脱 `webapi` 的限流。
-- 文件夹分享（`/d/...`）没有实现，手里的样本都已失效。
-- VIP 账号的 `limit` 是多少没验证过（猜测更高）。
+- VIP 账号的 `limit` 是多少没验证过（猜测更高）；VIP 才会返回 `vip_*_url` 镜像线路。

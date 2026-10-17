@@ -49,7 +49,7 @@ namespace CtfileDownloader
         {
             // 不走系统代理：城通是境内站点，直连更稳（代理挂了也能用）
             var handler = new HttpClientHandler { UseProxy = false, AllowAutoRedirect = true };
-            var c = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(40) };
+            var c = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(60) };
             c.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent", ua ?? Ua);
             return c;
         }
@@ -57,6 +57,7 @@ namespace CtfileDownloader
         public class Parsed
         {
             public string Code, Passcode, PageUrl;
+            public char Kind = 'f';    // f = 单文件，d = 文件夹
         }
 
         public static Parsed Parse(string input)
@@ -72,23 +73,23 @@ namespace CtfileDownloader
                 if (!Uri.TryCreate(s, UriKind.Absolute, out u)) throw new Exception("链接格式不对，请检查是否复制完整");
                 var m = rx.Match(u.AbsolutePath);
                 if (!m.Success) throw new Exception("看不懂这个链接，需要形如 https://url91.ctfile.com/f/37476991-1447877437-0eb71b 的分享链接");
-                if (m.Groups[1].Value[0] != 'f') throw new Exception("目前只支持单文件分享（/f/...），文件夹分享暂未支持");
                 string pc = "";
                 var q = u.Query;
                 var mp = System.Text.RegularExpressions.Regex.Match(q, @"[?&](?:p|passcode)=([^&]*)");
                 if (mp.Success) pc = Uri.UnescapeDataString(mp.Groups[1].Value);
-                return new Parsed { Code = m.Groups[2].Value, Passcode = pc, PageUrl = s };
+                return new Parsed { Code = m.Groups[2].Value, Passcode = pc, PageUrl = s, Kind = m.Groups[1].Value[0] };
             }
             var m2 = rx2.Match(s);
             if (!m2.Success) throw new Exception("看不懂这个分享码，应为 37476991-1447877437-0eb71b 这种格式");
-            return new Parsed { Code = m2.Groups[1].Value, Passcode = "", PageUrl = "https://url91.ctfile.com/f/" + m2.Groups[1].Value };
+            return new Parsed { Code = m2.Groups[1].Value, Passcode = "", PageUrl = "https://url91.ctfile.com/f/" + m2.Groups[1].Value, Kind = 'f' };
         }
 
         // 城通会按接口主机限流（短时间请求太多就返 429）。这里统一做退避重试，
         // 重试仍失败就给一句人话，而不是把 HTTP 状态码糊到用户脸上。
         static async Task<JsonElement> SendJson(HttpClient c, Func<HttpRequestMessage> makeReq, string what, Action<string> log = null)
         {
-            int[] waits = { 2000, 5000 };
+            // 429 = 限流，503/504 = 城通服务端偶发网关错误（实测深层目录请求常发），都重试
+            int[] waits = { 2000, 5000, 10000 };
             for (int attempt = 0; ; attempt++)
             {
                 using (var req = makeReq())
@@ -96,18 +97,22 @@ namespace CtfileDownloader
                 {
                     int code = (int)res.StatusCode;
                     var txt = await res.Content.ReadAsStringAsync().ConfigureAwait(false);
-                    if (code == 429)
+                    if (code == 429 || code == 503 || code == 504)
                     {
                         if (attempt < waits.Length)
                         {
-                            if (log != null) log($"被限流，{waits[attempt] / 1000} 秒后重试…");
+                            if (log != null) log($"服务端返回 {code}，{waits[attempt] / 1000} 秒后重试…");
                             await Task.Delay(waits[attempt]).ConfigureAwait(false);
                             continue;
                         }
+                        if (code == 429)
+                            throw new Exception(
+                                "城通把这个 IP 限流了（HTTP 429，请求过于频繁）。\n\n" +
+                                "这不是链接失效，等 10~30 分钟再试就行。\n" +
+                                "如果是刚批量解析过很多链接，属于正常现象。");
                         throw new Exception(
-                            "城通把这个 IP 限流了（HTTP 429，请求过于频繁）。\n\n" +
-                            "这不是链接失效，等 10~30 分钟再试就行。\n" +
-                            "如果是刚批量解析过很多链接，属于正常现象。");
+                            $"城通服务端持续返回 {code}（重试 {waits.Length} 次仍失败）。\n" +
+                            "通常是对方网关繁忙，稍后再试。");
                     }
                     if (code == 403 && string.IsNullOrWhiteSpace(txt))
                         throw new Exception("城通拒绝了请求（HTTP 403）。通常是 IP 被临时限制，稍后再试。");
@@ -446,6 +451,172 @@ namespace CtfileDownloader
                 }
             report(true);
             return n;
+        }
+
+        // ==================== 文件夹分享 ====================
+
+        /// <summary>文件夹里的一個文件项</summary>
+        public class FolderFile
+        {
+            public string Path { get; set; }      // 含子目录的完整路径
+            public string Name { get; set; }
+            public string FileCode { get; set; }  // 用于取直链
+            public long Size { get; set; }
+            public string SizeText { get; set; }
+            public string Date { get; set; }
+            public bool Checked { get; set; } = true;   // 默认勾选
+        }
+
+        public class FolderResult
+        {
+            public string FolderName { get; set; }
+            public List<FolderFile> Files { get; set; } = new List<FolderFile>();
+            public List<string> Warnings { get; set; } = new List<string>();
+            public int DirCount { get; set; }
+            public long TotalBytes { get { long n = 0; foreach (var f in Files) n += f.Size; return n; } }
+        }
+
+        // 从列1 的 HTML 里提取信息
+        static readonly System.Text.RegularExpressions.Regex RxFileName =
+            new System.Text.RegularExpressions.Regex(@"filename-text"">.*?<a [^>]*>([^<]+)</a>", System.Text.RegularExpressions.RegexOptions.Singleline);
+        static readonly System.Text.RegularExpressions.Regex RxSubDir =
+            new System.Text.RegularExpressions.Regex(@"load_subdir\((\d+),\s*'([0-9a-f]+)'\)");
+        static readonly System.Text.RegularExpressions.Regex RxHref =
+            new System.Text.RegularExpressions.Regex(@"href=""([^""]*)""");
+
+        static long ParseSizeText(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return 0;
+            var m = System.Text.RegularExpressions.Regex.Match(s.Trim(), @"^([\d.]+)\s*(GB|MB|KB|B)$", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            if (!m.Success) return 0;
+            double v;
+            if (!double.TryParse(m.Groups[1].Value, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out v)) return 0;
+            switch (m.Groups[2].Value.ToUpper())
+            {
+                case "GB": return (long)(v * 1073741824);
+                case "MB": return (long)(v * 1048576);
+                case "KB": return (long)(v * 1024);
+                default: return (long)v;
+            }
+        }
+
+        /// <summary>
+        /// 递归遍历文件夹分享，返回全部文件。
+        /// 关键点：folder_id 必须传数字 fid（load_subdir 的第一参数），传 hash 会 504。
+        /// </summary>
+        public static async Task<FolderResult> ListFolderAsync(Parsed p, Action<string> log = null, CancellationToken ct = default(CancellationToken))
+        {
+            void L(string s) { if (log != null) log(s); }
+            var result = new FolderResult();
+
+            // 提取码用 cookie 传（文件夹接口对 ?p= 不总是认）
+            string shareId = p.Code.Split('-').Length > 1 ? p.Code.Split('-')[1] : "";
+            var http = NewClient();
+            string origin = null;
+            try { origin = new Uri(p.PageUrl).Scheme + "://" + new Uri(p.PageUrl).Host; } catch { }
+            if (origin != null) http.DefaultRequestHeaders.TryAddWithoutValidation("Origin", origin);
+            if (!string.IsNullOrEmpty(p.Passcode) && shareId.Length > 0)
+                http.DefaultRequestHeaders.TryAddWithoutValidation("Cookie", "pass_d" + shareId + "=" + p.Passcode);
+
+            var dirs = new System.Collections.Generic.HashSet<string>();
+
+            async Task Walk(string folderId, string prefix, int depth)
+            {
+                if (depth > 6) { result.Warnings.Add("目录层级超过 6 层，已停止深挖"); return; }
+                var url = WebApi + "/getdir.php?path=d&d=" + Uri.EscapeDataString(p.Code) + "&folder_id=" + (folderId ?? "");
+                var dirInfo = await GetJson(http, url, p.PageUrl, L).ConfigureAwait(false);
+                int dc = dirInfo.TryGetProperty("code", out var dce) ? dce.GetInt32() : 0;
+                if (dc != 200)
+                {
+                    string msg = dirInfo.TryGetProperty("message", out var dme) ? dme.GetString() : "";
+                    if (dc == 503) throw new Exception("分享已失效或被限制（503）" + (string.IsNullOrEmpty(msg) ? "" : "：" + msg));
+                    if (dc == 423) throw new Exception("这个分享需要提取码，请在链接后面加 ?p=提取码");
+                    throw new Exception("读取目录失败（code=" + dc + "）" + (string.IsNullOrEmpty(msg) ? "" : "：" + msg));
+                }
+                if (!dirInfo.TryGetProperty("file", out var fileEl)) return;
+                string folderName = fileEl.TryGetProperty("folder_name", out var fne) ? fne.GetString() : "(未命名目录)";
+                string listUrl = fileEl.TryGetProperty("url", out var ue) ? ue.GetString() : null;
+                if (string.IsNullOrEmpty(listUrl)) return;
+                if (result.FolderName == null) result.FolderName = folderName;
+
+                string curPath = string.IsNullOrEmpty(prefix) ? folderName : prefix + "/" + folderName;
+                dirs.Add(curPath);
+
+                var listJson = await GetJson(http, WebApi + listUrl, p.PageUrl, L).ConfigureAwait(false);
+                if (!listJson.TryGetProperty("aaData", out var aa) || aa.ValueKind != JsonValueKind.Array) return;
+
+                foreach (var it in aa.EnumerateArray())
+                {
+                    ct.ThrowIfCancellationRequested();
+                    string html = it.ValueKind == JsonValueKind.Array && it.GetArrayLength() > 1 ? it[1].GetString() : null;
+                    if (string.IsNullOrEmpty(html)) continue;
+
+                    var nm = RxFileName.Match(html);
+                    string name = nm.Success ? nm.Groups[1].Value.Trim() : "(无名)";
+                    var sub = RxSubDir.Match(html);
+                    if (sub.Success)
+                    {
+                        // 子目录：用第一参数（数字 fid）
+                        await Walk(sub.Groups[1].Value, curPath, depth + 1).ConfigureAwait(false);
+                        continue;
+                    }
+                    var href = RxHref.Match(html);
+                    if (!href.Success) continue;
+                    string[] fc = href.Groups[1].Value.Split('/');
+                    string fileCode = fc[fc.Length - 1];
+                    if (fileCode.Length == 0) continue;
+
+                    string sizeText = it.GetArrayLength() > 2 && it[2].ValueKind == JsonValueKind.String ? it[2].GetString() : "";
+                    string date = it.GetArrayLength() > 3 && it[3].ValueKind == JsonValueKind.String ? it[3].GetString() : "";
+                    result.Files.Add(new FolderFile
+                    {
+                        Path = curPath + "/" + name,
+                        Name = name,
+                        FileCode = fileCode,
+                        Size = ParseSizeText(sizeText),
+                        SizeText = sizeText,
+                        Date = date,
+                    });
+                }
+            }
+
+            await Walk("", "", 0).ConfigureAwait(false);
+            result.DirCount = dirs.Count;
+            if (result.Files.Count == 0)
+            {
+                if (result.DirCount > 0) throw new Exception("这个分享里只有空目录，没有可下载的文件");
+                throw new Exception("没有解析出任何文件");
+            }
+            L("共 " + result.DirCount + " 个目录、" + result.Files.Count + " 个文件");
+            return result;
+        }
+
+        /// <summary>给文件夹里的单个文件取一条匿名直链</summary>
+        public static async Task<Source> GetFileLinkAsync(string fileCode, string pageUrl, Action<string> log = null)
+        {
+            var http = NewClient();
+            var url = WebApi + "/getfile.php?path=f&f=" + Uri.EscapeDataString(fileCode) + "&r=" + new Random().NextDouble() + "&ref=&url=" + Uri.EscapeDataString(pageUrl ?? "");
+            var j = await GetJson(http, url, pageUrl, log).ConfigureAwait(false);
+            int code = j.TryGetProperty("code", out var ce) ? ce.GetInt32() : 0;
+            if (code != 200 || !j.TryGetProperty("file", out var f))
+                throw new Exception("取文件信息失败（code=" + code + "）" + (j.TryGetProperty("message", out var me) ? me.GetString() : ""));
+
+            string q = "uid=" + Str(f, "userid") + "&fid=" + Str(f, "file_id")
+                     + "&file_chk=" + Str(f, "file_chk") + "&start_time=" + Str(f, "start_time")
+                     + "&wait_seconds=" + Str(f, "wait_seconds") + "&rd=" + new Random().NextDouble();
+            var du = await GetJson(http, WebApi + "/get_down_url.php?" + q, pageUrl, log).ConfigureAwait(false);
+            if (!du.TryGetProperty("downurl", out var durl) || string.IsNullOrEmpty(durl.GetString()))
+                throw new Exception("没拿到下载地址");
+            string u = durl.GetString();
+            return new Source
+            {
+                Url = u,
+                Threads = 1,
+                Label = "匿名",
+                Kind = "anonymous",
+                Host = SafeHost(u),
+                Spd = ReadSpd(u),
+            };
         }
     }
 }

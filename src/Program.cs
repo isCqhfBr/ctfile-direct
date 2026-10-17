@@ -66,6 +66,65 @@ namespace CtfileDownloader
             AppConfig cfg = new AppConfig();
             try { if (File.Exists(cfgPath)) cfg = JsonSerializer.Deserialize<AppConfig>(File.ReadAllText(cfgPath)) ?? cfg; } catch { }
 
+            // 文件夹分享
+            var parsed = Ctfile.Parse(link);
+            if (parsed.Kind == 'd')
+            {
+                Ctfile.FolderResult fr;
+                try { fr = await Ctfile.ListFolderAsync(parsed, s => Console.WriteLine("  " + s)); }
+                catch (Exception ex) { Console.WriteLine("解析失败: " + ex.Message); return 1; }
+
+                Console.WriteLine();
+                Console.WriteLine("文件夹 : " + fr.FolderName);
+                Console.WriteLine("文件数 : " + fr.Files.Count + " 个，共 " + Fmt(fr.TotalBytes) + "（" + fr.DirCount + " 个目录）");
+                foreach (var w in fr.Warnings) Console.WriteLine("  ! " + w);
+                int show = Math.Min(fr.Files.Count, 30);
+                for (int i = 0; i < show; i++)
+                {
+                    var f = fr.Files[i];
+                    Console.WriteLine("   · " + f.Path + "  " + (string.IsNullOrEmpty(f.SizeText) ? "-" : f.SizeText));
+                }
+                if (fr.Files.Count > show) Console.WriteLine("   … 还有 " + (fr.Files.Count - show) + " 个文件");
+
+                if (noDownload) return 0;
+                if (string.IsNullOrEmpty(outDir))
+                    outDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads");
+                Directory.CreateDirectory(outDir);
+
+                var ctsF = new CancellationTokenSource();
+                int ok = 0, fail = 0;
+                var fails = new List<string>();
+                var swF = System.Diagnostics.Stopwatch.StartNew();
+                long doneF = 0;
+                foreach (var f in fr.Files)
+                {
+                    string rel = f.Path;
+                    int slash = rel.IndexOf('/');
+                    if (slash > 0) rel = rel.Substring(slash + 1);
+                    string fOut = Path.Combine(outDir, Sanitize(rel));
+                    try { Directory.CreateDirectory(Path.GetDirectoryName(fOut)); } catch { }
+                    Console.WriteLine(string.Format("[{0}/{1}] {2}", ok + fail + 1, fr.Files.Count, f.Path));
+                    try
+                    {
+                        var src = await Ctfile.GetFileLinkAsync(f.FileCode, parsed.PageUrl);
+                        await Ctfile.DownloadAsync(new List<Source> { src }, fOut, (d, t2, sp) =>
+                        {
+                            long abs = doneF + d;
+                            int pct = fr.TotalBytes > 0 ? (int)(abs * 100 / fr.TotalBytes) : 0;
+                            Console.WriteLine(string.Format("      {0}%  {1}  {2}/s", pct, Fmt(abs), Fmt((long)sp)));
+                        }, ctsF.Token);
+                        ok++;
+                    }
+                    catch (Exception ex) { fail++; fails.Add(f.Path + "：" + ex.Message); }
+                    doneF += f.Size;
+                }
+                Console.WriteLine();
+                Console.WriteLine(string.Format("完成: {0} 个成功，{1} 个失败，用时 {2:F1} 秒", ok, fail, swF.Elapsed.TotalSeconds));
+                foreach (var x in fails) Console.WriteLine("  ! " + x);
+                Console.WriteLine("保存到 : " + outDir);
+                return fail > 0 ? 1 : 0;
+            }
+
             Resolved r;
             try
             {
@@ -124,6 +183,14 @@ namespace CtfileDownloader
                 Console.WriteLine("下载失败: " + ex.Message);
                 return 1;
             }
+        }
+
+        static string Sanitize(string s)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return "unnamed.bin";
+            foreach (var c in Path.GetInvalidFileNameChars()) s = s.Replace(c, '_');
+            foreach (var c in Path.GetInvalidPathChars()) s = s.Replace(c, '_');
+            return s.Trim();
         }
     }
 }
