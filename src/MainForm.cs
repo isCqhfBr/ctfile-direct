@@ -23,14 +23,16 @@ namespace CtfileDownloader
 
         TextBox txtLink, txtOutDir, txtEmail, txtPass;
         Button btnResolve, btnDl, btnCancel, btnBrowse, btnOpenDir, btnAddAcc, btnDelAcc, btnAll, btnNone, btnInvert;
-        Label lblFile, lblStats, lblStatus, lblFiles;
+        Label lblFile, lblStats, lblStatus, lblFiles, lblExpiry;
         ListView lvSources, lvAccounts, lvFiles;
         ProgressBar bar;
         CheckBox chkAnon;
+        System.Windows.Forms.Timer _expiryTimer;
 
         Resolved _resolved;
         Ctfile.FolderResult _folder;
         Ctfile.Parsed _parsed;
+        DateTime _expiry;
         CancellationTokenSource _cts;
         bool _busy;
         string _cfgPath;
@@ -39,13 +41,17 @@ namespace CtfileDownloader
         {
             Text = "城通网盘 多账号加速下载";
             ClientSize = new Size(960, 880);
-            MinimumSize = new Size(880, 840);            BackColor = C_BG;
+            MinimumSize = new Size(880, 840);
+            BackColor = C_BG;
             ForeColor = C_FG;
             Font = new Font("Microsoft YaHei UI", 9F);
             StartPosition = FormStartPosition.CenterScreen;
             _cfgPath = Path.Combine(ExeDir(), "config.json");
             BuildUi();
             LoadConfig();
+            _expiryTimer = new System.Windows.Forms.Timer { Interval = 1000 };
+            _expiryTimer.Tick += (a, b) => UpdateExpiryLabel();
+            _expiryTimer.Start();
             if (!string.IsNullOrEmpty(initialLink))
             {
                 txtLink.Text = initialLink;
@@ -143,6 +149,8 @@ namespace CtfileDownloader
 
             // ② 下载来源
             MkLabel("② 下载来源", PAD, 154, C_DIM, 9F, true);
+            lblExpiry = MkLabel("", 560, 155, C_DIM, 9F);
+            lblExpiry.Anchor = AnchorStyles.Top | AnchorStyles.Right;
             lvSources = new ListView
             {
                 Location = new Point(PAD, 174),
@@ -199,6 +207,7 @@ namespace CtfileDownloader
             MkLabel("保存目录", PAD, 466, C_DIM, 9F, true);
             txtOutDir = MkText(PAD, 486, 700);
             txtOutDir.Text = DefaultDir();
+            txtOutDir.Leave += (a, b) => SaveConfig();
             btnBrowse = MkButton("浏览…", 724, 484, 100, 28, false);
             btnBrowse.Click += (a, b) =>
             {
@@ -287,6 +296,7 @@ namespace CtfileDownloader
             catch { }
             _cfg = cfg;                     // 必须先赋值：下面设置 chkAnon.Checked 会触发 CheckedChanged
             chkAnon.Checked = cfg.useAnonymous;
+            if (!string.IsNullOrWhiteSpace(cfg.outDir)) txtOutDir.Text = cfg.outDir;
             RefreshAccounts(_cfg);
             lblStatus.Text = "配置：" + _cfgPath;
             _loading = false;               // 加载完成后才允许写盘
@@ -321,6 +331,7 @@ namespace CtfileDownloader
                 {
                     _说明 = "城通网盘账号池：每个账号 +2 线程，N 个账号 = 2N 线程，匿名 +1。密码明文存储。",
                     useAnonymous = chkAnon.Checked,
+                    outDir = txtOutDir.Text,
                     accounts = _cfg.accounts.Select(x => new { x.email, x.password }).ToList(),
                 }, new JsonSerializerOptions
                 {
@@ -378,7 +389,9 @@ namespace CtfileDownloader
                 if (parsed.Kind == 'd')
                 {
                     // 文件夹分享
-                    var fr = await Ctfile.ListFolderAsync(parsed, SetStatus, _cts == null ? default(CancellationToken) : _cts.Token);                    _folder = fr;
+                    var fr = await Ctfile.ListFolderAsync(parsed, SetStatus, _cts == null ? default(CancellationToken) : _cts.Token);
+                    _folder = fr;
+                    _expiry = DateTime.MinValue;   // 文件夹逐个取链，无统一过期
                     lblFile.Text = fr.FolderName + "    " + fr.Files.Count + " 个文件    " + Fmt(fr.TotalBytes);
                     foreach (var f in fr.Files)
                     {
@@ -420,6 +433,10 @@ namespace CtfileDownloader
                     btnDl.Enabled = true;
                     lblStats.Text = r.Warnings.Count > 0 ? "⚠ " + string.Join("；", r.Warnings) : "就绪，点「开始下载」";
                     lblStatus.Text = "解析成功";
+
+                    // 直链过期倒计时（读最早一条的 ctt）
+                    _expiry = Ctfile.EarliestExpiry(r.Sources);
+                    UpdateExpiryLabel();
                 }
             }
             catch (Exception ex)
@@ -463,6 +480,24 @@ namespace CtfileDownloader
                 n++; bytes += f.Size;
             }
             lblStats.Text = string.Format("已选 {0} / {1} 个文件，共 {2}", n, _folder.Files.Count, Fmt(bytes));
+        }
+
+        void UpdateExpiryLabel()
+        {
+            if (_expiry == DateTime.MinValue) { lblExpiry.Text = ""; return; }
+            var span = _expiry - DateTime.Now;
+            if (span.TotalSeconds <= 0)
+            {
+                lblExpiry.Text = "⚠ 直链已过期，请重新解析";
+                lblExpiry.ForeColor = C_RED;
+                return;
+            }
+            string left;
+            if (span.TotalHours >= 1) left = string.Format("{0} 小时 {1} 分", (int)span.TotalHours, span.Minutes);
+            else if (span.TotalMinutes >= 1) left = string.Format("{0} 分 {1} 秒", (int)span.TotalMinutes, span.Seconds);
+            else left = span.Seconds + " 秒";
+            lblExpiry.Text = "直链剩余 " + left + "（" + _expiry.ToString("HH:mm:ss") + " 过期）";
+            lblExpiry.ForeColor = span.TotalMinutes < 10 ? C_RED : C_DIM;
         }
 
         // ---------------- 下载 ----------------

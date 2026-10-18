@@ -5,6 +5,12 @@ using System.Text.Json;
 
 namespace CtfileDownloader
 {
+    /// <summary>CDN 软限流（HTTP 429）。区别于硬错误：等一会儿通常能恢复，应当折进退避而非立刻甩手。</summary>
+    internal sealed class ThrottleException : Exception
+    {
+        public ThrottleException() : base("下载被城通限流（HTTP 429），等几分钟再试") { }
+    }
+
     public class Source
     {
         public string Url { get; set; }
@@ -13,6 +19,11 @@ namespace CtfileDownloader
         public string Host { get; set; }
         public string Kind { get; set; }   // account / anonymous
         public int Spd { get; set; }        // 单连接限速（字节/秒），服务端下发；0 = 未知
+
+        // 续取一条新直链。直链带 ctt 有效期（约 6 小时），长任务跑过 ctt 后旧链会开始 503，
+        // 重试时不该拿同一条死链硬撞。匿名源取不到账号信息，Refetch 留 null；账号源由
+        // ResolveAsync 注入。
+        public Func<CancellationToken, Task<Source>> Refetch { get; set; }
     }
 
     public class Resolved
@@ -34,10 +45,14 @@ namespace CtfileDownloader
     {
         public bool useAnonymous { get; set; } = true;
         public List<Account> accounts { get; set; } = new List<Account>();
+        public string outDir { get; set; }   // 记住上次用的保存目录
     }
 
     public static class Ctfile
     {
+        // 退避抖动用一个即可：.NET 的 Random 线程安全，new Random() 每请求造一个更糟。
+        static readonly System.Random rnd = new System.Random();
+
         public const string Ua =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
         const string OkHttp = "okhttp/4.9.2";
@@ -86,14 +101,17 @@ namespace CtfileDownloader
 
         // 城通会按接口主机限流（短时间请求太多就返 429）。这里统一做退避重试，
         // 重试仍失败就给一句人话，而不是把 HTTP 状态码糊到用户脸上。
-        static async Task<JsonElement> SendJson(HttpClient c, Func<HttpRequestMessage> makeReq, string what, Action<string> log = null)
+        static Task<JsonElement> SendJson(HttpClient c, Func<HttpRequestMessage> makeReq, string what, Action<string> log = null)
+            => SendJson(c, makeReq, what, log, CancellationToken.None);
+
+        static async Task<JsonElement> SendJson(HttpClient c, Func<HttpRequestMessage> makeReq, string what, Action<string> log, CancellationToken ct)
         {
             // 429 = 限流，503/504 = 城通服务端偶发网关错误（实测深层目录请求常发），都重试
             int[] waits = { 2000, 5000, 10000 };
             for (int attempt = 0; ; attempt++)
             {
                 using (var req = makeReq())
-                using (var res = await c.SendAsync(req).ConfigureAwait(false))
+                using (var res = await c.SendAsync(req, ct).ConfigureAwait(false))
                 {
                     int code = (int)res.StatusCode;
                     var txt = await res.Content.ReadAsStringAsync().ConfigureAwait(false);
@@ -102,7 +120,7 @@ namespace CtfileDownloader
                         if (attempt < waits.Length)
                         {
                             if (log != null) log($"服务端返回 {code}，{waits[attempt] / 1000} 秒后重试…");
-                            await Task.Delay(waits[attempt]).ConfigureAwait(false);
+                            await Task.Delay(waits[attempt], ct).ConfigureAwait(false);
                             continue;
                         }
                         if (code == 429)
@@ -138,10 +156,27 @@ namespace CtfileDownloader
                     req.Headers.TryAddWithoutValidation("X-Requested-With", "XMLHttpRequest");
                 }
                 return req;
-            }, "取文件信息接口", log);
+            }, "取文件信息接口", log, CancellationToken.None);
+        }
+
+        static Task<JsonElement> GetJson(HttpClient c, string url, string referer, Action<string> log, CancellationToken ct)
+        {
+            return SendJson(c, () =>
+            {
+                var req = new HttpRequestMessage(HttpMethod.Get, url);
+                if (referer != null)
+                {
+                    req.Headers.TryAddWithoutValidation("Referer", referer);
+                    req.Headers.TryAddWithoutValidation("X-Requested-With", "XMLHttpRequest");
+                }
+                return req;
+            }, "取文件信息接口", log, ct);
         }
 
         static Task<JsonElement> PostJson(HttpClient c, string url, string json, string referer = null, string bearer = null, Action<string> log = null)
+            => PostJson(c, url, json, referer, bearer, log, CancellationToken.None);
+
+        static Task<JsonElement> PostJson(HttpClient c, string url, string json, string referer, string bearer, Action<string> log, CancellationToken ct)
         {
             return SendJson(c, () =>
             {
@@ -151,7 +186,7 @@ namespace CtfileDownloader
                 req.Headers.TryAddWithoutValidation("Referer", referer ?? "https://my.ctfile.com/");
                 if (bearer != null) req.Headers.TryAddWithoutValidation("Authorization", "Bearer " + bearer);
                 return req;
-            }, "城通接口", log);
+            }, "城通接口", log, ct);
         }
 
         public static async Task<Resolved> ResolveAsync(string input, AppConfig cfg, Action<string> log = null)
@@ -179,6 +214,37 @@ namespace CtfileDownloader
             {
                 string xtlink = "ctfile://" + xtredirect;
                 string listJson = null;
+
+                // 续取一条直链：登录 → file/list → fetch_url。同一账号重取会拿到同一条
+                // 直链（账号接口目前只发一条），所以价值不在"换一条更快的"，而在于
+                // 旧链的 ctt 过期后能拿到一条新的、把 ctt 重新延后 360 分钟。
+                Func<CancellationToken, Task<Source>> makeRefetch(Account acct)
+                {
+                    return async (ct) =>
+                    {
+                        var lg2 = await PostJson(http, Api + "/v4/user/auth/login",
+                            JsonSerializer.Serialize(new { email = acct.email, password = acct.password }), null, null, L, ct).ConfigureAwait(false);
+                        int lc2 = lg2.TryGetProperty("code", out var lce2) ? lce2.GetInt32() : 0;
+                        if (lc2 != 200 || !lg2.TryGetProperty("data", out var d2) || !d2.TryGetProperty("token", out var tk2))
+                            return null;
+                        string tok2 = tk2.GetString();
+                        if (listJson == null) return null;
+                        var l2 = JsonDocument.Parse(listJson).RootElement;
+                        string fk = null;
+                        foreach (var it in l2.GetProperty("results").EnumerateArray())
+                        {
+                            if ((it.TryGetProperty("icon", out var ic2) ? ic2.GetString() : "") == "folder") continue;
+                            fk = it.GetProperty("key").GetString(); break;
+                        }
+                        if (fk == null) return null;
+                        var d3 = await PostJson(http, Rest + "/p2/browser/file/fetch_url",
+                            JsonSerializer.Serialize(new { xtlink, file_id = fk, token = tok2 }), null, null, L, ct).ConfigureAwait(false);
+                        string u2 = d3.TryGetProperty("download_url", out var du2) ? du2.GetString() : null;
+                        if (string.IsNullOrEmpty(u2)) return null;
+                        return new Source { Url = u2, Threads = 1, Label = acct.email, Kind = "account", Host = SafeHost(u2), Spd = ReadSpd(u2) };
+                    };
+                }
+
                 foreach (var acc in cfg.accounts)
                 {
                     try
@@ -226,7 +292,12 @@ namespace CtfileDownloader
                         {
                             int th = 2;
                             try { var q2 = new Uri(url).Query; var mt = System.Text.RegularExpressions.Regex.Match(q2, @"[?&]limit=(\d+)"); if (mt.Success) th = int.Parse(mt.Groups[1].Value); } catch { }
-                            result.Sources.Add(new Source { Url = url, Threads = th, Label = acc.email, Kind = "account", Host = SafeHost(url), Spd = ReadSpd(url) });
+                            result.Sources.Add(new Source
+                            {
+                                Url = url, Threads = th, Label = acc.email, Kind = "account",
+                                Host = SafeHost(url), Spd = ReadSpd(url),
+                                Refetch = makeRefetch(acc),
+                            });
                             if (!string.IsNullOrEmpty(itemName)) result.FileName = itemName;
                             if (itemSize > 0) result.FileSize = itemSize;
                             L(acc.email + " → " + th + " 线程");
@@ -279,6 +350,39 @@ namespace CtfileDownloader
         static string SafeHost(string url)
         {
             try { return new Uri(url).Host; } catch { return "?"; }
+        }
+
+        /// <summary>
+        /// 从直链的 ctt 参数读过期时间（Unix 秒）。DateTime.MinValue = 读不到。
+        /// 实测 ctt 就是精确的失效时刻（当前时间 + 6 小时）。
+        /// </summary>
+        public static DateTime ReadExpiry(string url)
+        {
+            try
+            {
+                var m = System.Text.RegularExpressions.Regex.Match(new Uri(url).Query, @"[?&]ctt=(\d+)");
+                if (m.Success)
+                {
+                    long ts = long.Parse(m.Groups[1].Value);
+                    if (ts > 1700000000 && ts < 4102444800)   // 2023~2100 合理性检查
+                        return DateTimeOffset.FromUnixTimeSeconds(ts).LocalDateTime;
+                }
+            }
+            catch { }
+            return DateTime.MinValue;
+        }
+
+        /// <summary>取一批直链里最早的过期时间</summary>
+        public static DateTime EarliestExpiry(IEnumerable<Source> sources)
+        {
+            DateTime earliest = DateTime.MaxValue;
+            foreach (var s in sources)
+            {
+                if (string.IsNullOrEmpty(s.Url)) continue;
+                var e = ReadExpiry(s.Url);
+                if (e != DateTime.MinValue && e < earliest) earliest = e;
+            }
+            return earliest == DateTime.MaxValue ? DateTime.MinValue : earliest;
         }
 
         /// <summary>从直链里读单连接限速（字节/秒）。0 = 读不到</summary>
@@ -405,20 +509,27 @@ namespace CtfileDownloader
                         long start = i * chunk;
                         long end = Math.Min(start + chunk - 1, size - 1);
                         if (start > end) continue;
+                        // C# 的 for 循环变量是闭包共享的：回调异步执行时 i 已变成 n-1。
+                        // 所有要用的值都必须在循环体内同步取出。
                         string url = workers[i].Url;
+                        var refetch = workers[i].Refetch;
                         tasks.Add(Task.Run(async () =>
                         {
+                            // url 只作首跳。重试一律重新取链，理由见 Source.Refetch 注释。
+                            string cur = url;
                             int attempt = 0;
                             while (true)
                             {
                                 try
                                 {
-                                    var req = new HttpRequestMessage(HttpMethod.Get, url);
+                                    var req = new HttpRequestMessage(HttpMethod.Get, cur);
                                     req.Headers.TryAddWithoutValidation("Range", "bytes=" + start + "-" + end);
                                     using (var res = await http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false))
                                     {
+                                        // 429 是软限流：IP 被打上标记，等一会儿通常能恢复，
+                                        // 直接甩手会把整盘下载判死。折进退避，退避时长取 3 秒 × 重试次数。
                                         if (res.StatusCode == (HttpStatusCode)429)
-                                            throw new Exception("下载被城通限流（HTTP 429），等几分钟再试");
+                                            throw new ThrottleException();
                                         if (res.StatusCode != HttpStatusCode.PartialContent && res.StatusCode != HttpStatusCode.OK)
                                             throw new Exception("HTTP " + (int)res.StatusCode);
                                         using (var stream = await res.Content.ReadAsStreamAsync(ct).ConfigureAwait(false))
@@ -439,10 +550,30 @@ namespace CtfileDownloader
                                     return;
                                 }
                                 catch (OperationCanceledException) { throw; }
-                                catch (Exception)
+                                catch (Exception ex)
                                 {
                                     if (++attempt >= 4) throw;
-                                    await Task.Delay(800 * attempt, ct).ConfigureAwait(false);
+                                    // 退避加随机抖动：多分块同时失败时错开重试时刻，
+                                    // 否则会在同一秒集体打向刚被限流的节点（上游模块的做法）。
+                                    double ms = ex is ThrottleException ? 3000 * attempt : 800 * attempt;
+                                    try { await Task.Delay((int)(ms * (1 + rnd.NextDouble() * 0.5)), ct).ConfigureAwait(false); }
+                                    catch (OperationCanceledException) { throw; }
+
+                                    // 换链。只有账号源有 Refetch；匿名源在取链失败时退回原链。
+                                    if (refetch != null)
+                                    {
+                                        try
+                                        {
+                                            var fresh = await refetch(ct).ConfigureAwait(false);
+                                            if (fresh != null && !string.IsNullOrEmpty(fresh.Url)) cur = fresh.Url;
+                                        }
+                                        catch (OperationCanceledException) { throw; }
+                                        catch (Exception e2)
+                                        {
+                                            // 续取失败不致命：旧链可能还没过期，继续用它试。
+                                            if (log != null) log("续取直链失败（继续用旧链）：" + e2.Message);
+                                        }
+                                    }
                                 }
                             }
                         }, ct));
@@ -601,12 +732,19 @@ namespace CtfileDownloader
             if (code != 200 || !j.TryGetProperty("file", out var f))
                 throw new Exception("取文件信息失败（code=" + code + "）" + (j.TryGetProperty("message", out var me) ? me.GetString() : ""));
 
-            string q = "uid=" + Str(f, "userid") + "&fid=" + Str(f, "file_id")
-                     + "&file_chk=" + Str(f, "file_chk") + "&start_time=" + Str(f, "start_time")
+            // 元数据缺字段时报错带上实际值（上游 ctfile_free.py:227-231 的做法）：
+            // 光说"没拿到"没法区分是分享失效、字段改名还是链接格式不对。
+            string uid = Str(f, "userid"), fid = Str(f, "file_id"), chk = Str(f, "file_chk");
+            if (uid.Length == 0 || fid.Length == 0 || chk.Length == 0)
+                throw new Exception("分享页元数据不完整：userid=" + uid + " file_id=" + fid + " file_chk=" + chk +
+                                    "（通常是该文件已被分享者删除或取消分享）");
+
+            string q = "uid=" + uid + "&fid=" + fid
+                     + "&file_chk=" + chk + "&start_time=" + Str(f, "start_time")
                      + "&wait_seconds=" + Str(f, "wait_seconds") + "&rd=" + new Random().NextDouble();
             var du = await GetJson(http, WebApi + "/get_down_url.php?" + q, pageUrl, log).ConfigureAwait(false);
             if (!du.TryGetProperty("downurl", out var durl) || string.IsNullOrEmpty(durl.GetString()))
-                throw new Exception("没拿到下载地址");
+                throw new Exception("没拿到下载地址（uid=" + uid + " fid=" + fid + "，可能是等待未结束或直链已过期）");
             string u = durl.GetString();
             return new Source
             {
