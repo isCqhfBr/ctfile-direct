@@ -614,6 +614,13 @@ namespace CtfileDownloader
             new System.Text.RegularExpressions.Regex(@"load_subdir\((\d+),\s*'([0-9a-f]+)'\)");
         static readonly System.Text.RegularExpressions.Regex RxHref =
             new System.Text.RegularExpressions.Regex(@"href=""([^""]*)""");
+        // 列0 复选框里的 file_ids[] value 才是服务端认的文件 id（形如 f8462389031）。
+        // 列1 的 href 现在是 href="#/f/tempdir-<base64>"：前端 SPA 路由占位，
+        // 不是 <uid>-<fid>-<chk> 的三段式分享码，直接拿去调 getfile.php 会一路 404。
+        static readonly System.Text.RegularExpressions.Regex RxFileId =
+            new System.Text.RegularExpressions.Regex(@"name=""file_ids\[\]""[^>]*value=""([^""]*)""");
+        static readonly System.Text.RegularExpressions.Regex RxShareCode =
+            new System.Text.RegularExpressions.Regex(@"(?:^|/)([0-9]+-[0-9]+-[0-9a-fA-F]+)");
 
         static long ParseSizeText(string s)
         {
@@ -691,14 +698,36 @@ namespace CtfileDownloader
                         await Walk(sub.Groups[1].Value, curPath, depth + 1).ConfigureAwait(false);
                         continue;
                     }
+                    // 文件 id 有两个来源：列1 href 里的三段式分享码（旧版），
+                    // 列0 file_ids[] 的 value（新版 SPA）。两者都拿不到就记一条 warning，
+                    // 不能静默丢掉——否则用户只看到「没有解析出任何文件」，无从判断原因。
+                    string fileCode = null;
                     var href = RxHref.Match(html);
-                    if (!href.Success) continue;
-                    string[] fc = href.Groups[1].Value.Split('/');
-                    string fileCode = fc[fc.Length - 1];
-                    if (fileCode.Length == 0) continue;
+                    if (href.Success)
+                    {
+                        var sc = RxShareCode.Match(href.Groups[1].Value);
+                        if (sc.Success) fileCode = sc.Groups[1].Value;
+                    }
+                    if (fileCode == null)
+                    {
+                        var col0 = it.GetArrayLength() > 0 && it[0].ValueKind == JsonValueKind.String ? it[0].GetString() : null;
+                        if (col0 != null)
+                        {
+                            var idm = RxFileId.Match(col0);
+                            if (idm.Success) fileCode = idm.Groups[1].Value;
+                        }
+                    }
 
                     string sizeText = it.GetArrayLength() > 2 && it[2].ValueKind == JsonValueKind.String ? it[2].GetString() : "";
                     string date = it.GetArrayLength() > 3 && it[3].ValueKind == JsonValueKind.String ? it[3].GetString() : "";
+
+                    if (fileCode == null)
+                    {
+                        result.Warnings.Add("跳过「" + name + "」：这个分享的页面结构变了，没能从中取出文件标识。" +
+                            "（单文件链接、代码里写死的 fileCode 不受影响。）");
+                        continue;
+                    }
+
                     result.Files.Add(new FolderFile
                     {
                         Path = curPath + "/" + name,
@@ -729,8 +758,16 @@ namespace CtfileDownloader
             var url = WebApi + "/getfile.php?path=f&f=" + Uri.EscapeDataString(fileCode) + "&r=" + new Random().NextDouble() + "&ref=&url=" + Uri.EscapeDataString(pageUrl ?? "");
             var j = await GetJson(http, url, pageUrl, log).ConfigureAwait(false);
             int code = j.TryGetProperty("code", out var ce) ? ce.GetInt32() : 0;
+            string msg = j.TryGetProperty("message", out var me2) ? me2.GetString() : "";
             if (code != 200 || !j.TryGetProperty("file", out var f))
-                throw new Exception("取文件信息失败（code=" + code + "）" + (j.TryGetProperty("message", out var me) ? me.GetString() : ""));
+            {
+                // code=404 + fileCode 不是三段式：多半是文件夹解析出的 id 形态变了
+                // （服务端把列1 href 改成 SPA 路由占位后，从 file_ids[] 取到的 fid 不完整）。
+                if (code == 404 && !RxShareCode.IsMatch(fileCode))
+                    throw new Exception("取文件信息失败：文件标识 " + fileCode + " 不是完整分享码，" +
+                        "很可能这个文件夹分享改用了新的页面结构。请改用单个文件的分享链接下载。");
+                throw new Exception("取文件信息失败（code=" + code + "）" + msg);
+            }
 
             // 元数据缺字段时报错带上实际值（上游 ctfile_free.py:227-231 的做法）：
             // 光说"没拿到"没法区分是分享失效、字段改名还是链接格式不对。
