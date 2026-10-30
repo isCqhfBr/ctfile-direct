@@ -245,6 +245,7 @@ namespace CtfileDownloader
                     };
                 }
 
+                bool captchaBlocked = false;
                 foreach (var acc in cfg.accounts)
                 {
                     try
@@ -254,6 +255,14 @@ namespace CtfileDownloader
                         int lc = lg.TryGetProperty("code", out var lce) ? lce.GetInt32() : 0;
                         if (lc != 200 || !lg.TryGetProperty("data", out var dataEl) || !dataEl.TryGetProperty("token", out var tkEl))
                         {
+                            // 城通 2026-10-26 起给登录加了 altcha 人机验证（PoW 挑战）。
+                            // 所有账号撞的是同一堵墙，只探一次就停：既避免刷屏，也避免
+                            // 反复试登录——多账号连续登录本身就是触发风控的动作。
+                            if ((lg.TryGetProperty("error_type", out var ete) ? ete.GetString() : null) == "captcha_required")
+                            {
+                                captchaBlocked = true;
+                                break;
+                            }
                             var m = lg.TryGetProperty("message", out var mme) ? mme.GetString() : "code=" + lc;
                             result.Warnings.Add(acc.email + " 登录失败：" + m);
                             continue;
@@ -312,6 +321,10 @@ namespace CtfileDownloader
                         result.Warnings.Add(acc.email + "：" + ex.Message);
                     }
                 }
+
+                if (captchaBlocked)
+                    result.Warnings.Insert(0,
+                        "城通已给账号登录加上人机验证（altcha），账号加速暂时不可用；已自动改用匿名直链（单连接）。");
             }
 
             // 3) 匿名槽
